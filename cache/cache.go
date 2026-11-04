@@ -6,8 +6,8 @@
 // every scrape is served from that stored result.
 //
 // Behaviour (ported from upstream openstack-exporter's --cache):
-//   - a sweep runs at start-up and then every ttl/2;
-//   - sweeps never overlap: if a sweep takes longer than ttl/2 the next one
+//   - a sweep runs at start-up and then every interval;
+//   - sweeps never overlap: if a sweep takes longer than interval the next one
 //     starts as soon as it finishes;
 //   - the stored result is replaced only once a sweep has fully completed, so
 //     a scrape never sees a mix of old and new values;
@@ -28,19 +28,21 @@ import (
 // Gatherer is a prometheus.Gatherer that serves the last result gathered from
 // source instead of gathering on every call.
 type Gatherer struct {
-	source prometheus.Gatherer
-	ttl    time.Duration
-	now    func() time.Time
-	logger log.Logger
+	source   prometheus.Gatherer
+	ttl      time.Duration
+	interval time.Duration
+	now      func() time.Time
+	logger   log.Logger
 
 	mu       sync.RWMutex
 	families []*dto.MetricFamily
 	updated  time.Time
 }
 
-// New returns a Gatherer caching the output of source for ttl.
-func New(source prometheus.Gatherer, ttl time.Duration, logger log.Logger) *Gatherer {
-	return &Gatherer{source: source, ttl: ttl, now: time.Now, logger: logger}
+// New returns a Gatherer that sweeps source every interval and serves each
+// sweep's result for up to ttl.
+func New(source prometheus.Gatherer, ttl, interval time.Duration, logger log.Logger) *Gatherer {
+	return &Gatherer{source: source, ttl: ttl, interval: interval, now: time.Now, logger: logger}
 }
 
 // Refresh runs one sweep against source and stores the result.
@@ -68,11 +70,11 @@ func (c *Gatherer) Gather() ([]*dto.MetricFamily, error) {
 	return c.families, nil
 }
 
-// Run refreshes the cache immediately and then every ttl/2 until stop is
+// Run refreshes the cache immediately and then every interval until stop is
 // closed. It blocks, so call it in its own goroutine.
 func (c *Gatherer) Run(stop <-chan struct{}) {
-	level.Info(c.logger).Log("msg", "Cache: starting background collection", "ttl", c.ttl, "interval", c.ttl/2)
-	ticker := time.NewTicker(c.ttl / 2)
+	level.Info(c.logger).Log("msg", "Cache: starting background collection", "ttl", c.ttl, "interval", c.interval)
+	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
 	for {

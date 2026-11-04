@@ -30,7 +30,7 @@ func family(name string) *dto.MetricFamily {
 
 func TestGatherBeforeFirstRefreshIsEmpty(t *testing.T) {
 	src := &countingGatherer{families: []*dto.MetricFamily{family("a")}}
-	c := New(src, time.Minute, log.NewNopLogger())
+	c := New(src, time.Minute, 30*time.Second, log.NewNopLogger())
 
 	mfs, err := c.Gather()
 	assert.NoError(t, err)
@@ -40,7 +40,7 @@ func TestGatherBeforeFirstRefreshIsEmpty(t *testing.T) {
 
 func TestManyScrapesShareOneSweep(t *testing.T) {
 	src := &countingGatherer{families: []*dto.MetricFamily{family("a"), family("b")}}
-	c := New(src, time.Minute, log.NewNopLogger())
+	c := New(src, time.Minute, 30*time.Second, log.NewNopLogger())
 
 	assert.NoError(t, c.Refresh())
 	for i := 0; i < 10; i++ {
@@ -53,7 +53,7 @@ func TestManyScrapesShareOneSweep(t *testing.T) {
 
 func TestExpiredCacheIsEmpty(t *testing.T) {
 	src := &countingGatherer{families: []*dto.MetricFamily{family("a")}}
-	c := New(src, time.Minute, log.NewNopLogger())
+	c := New(src, time.Minute, 30*time.Second, log.NewNopLogger())
 	now := time.Unix(1000, 0)
 	c.now = func() time.Time { return now }
 
@@ -70,7 +70,7 @@ func TestExpiredCacheIsEmpty(t *testing.T) {
 
 func TestPartialResultsAreStored(t *testing.T) {
 	src := &countingGatherer{families: []*dto.MetricFamily{family("a")}, err: errors.New("boom")}
-	c := New(src, time.Minute, log.NewNopLogger())
+	c := New(src, time.Minute, 30*time.Second, log.NewNopLogger())
 
 	assert.Error(t, c.Refresh())
 	mfs, _ := c.Gather()
@@ -79,7 +79,7 @@ func TestPartialResultsAreStored(t *testing.T) {
 
 func TestFailedRefreshKeepsPreviousResult(t *testing.T) {
 	src := &countingGatherer{families: []*dto.MetricFamily{family("a")}}
-	c := New(src, time.Minute, log.NewNopLogger())
+	c := New(src, time.Minute, 30*time.Second, log.NewNopLogger())
 	assert.NoError(t, c.Refresh())
 
 	src.families, src.err = nil, errors.New("boom")
@@ -91,7 +91,7 @@ func TestFailedRefreshKeepsPreviousResult(t *testing.T) {
 
 func TestRunRefreshesUntilStopped(t *testing.T) {
 	src := &countingGatherer{families: []*dto.MetricFamily{family("a")}}
-	c := New(src, 20*time.Millisecond, log.NewNopLogger())
+	c := New(src, time.Minute, 10*time.Millisecond, log.NewNopLogger())
 	stop := make(chan struct{})
 	done := make(chan struct{})
 
@@ -111,7 +111,7 @@ func TestServesRealRegistry(t *testing.T) {
 	reg.MustRegister(g)
 	g.Set(1)
 
-	c := New(reg, time.Minute, log.NewNopLogger())
+	c := New(reg, time.Minute, 30*time.Second, log.NewNopLogger())
 	assert.NoError(t, c.Refresh())
 
 	g.Set(2) // a scrape between sweeps must still see the swept value

@@ -40,7 +40,8 @@ var (
 	multiCloud               = kingpin.Flag("multi-cloud", "Toggle the multiple cloud scraping mode under /probe?cloud=").Default("false").Bool()
 	domainID                 = kingpin.Flag("domain-id", "Gather metrics only for the given Domain ID (defaults to all domains)").String()
 	cacheEnable              = kingpin.Flag("cache", "Collect metrics in the background and serve every scrape from the last collection (legacy mode only)").Default("false").Bool()
-	cacheTTL                 = kingpin.Flag("cache-ttl", "TTL for cached metrics (eg. 10s, 11m, 1h). Collection runs every cache-ttl/2; cached metrics older than cache-ttl are not served").Default("300s").Duration()
+	cacheTTL                 = kingpin.Flag("cache-ttl", "TTL for cached metrics (eg. 10s, 11m, 1h). Cached metrics older than cache-ttl are not served").Default("300s").Duration()
+	cacheInterval            = kingpin.Flag("cache-interval", "How often the background collection runs when --cache is enabled (eg. 30s, 5m). Must be less than --cache-ttl").Default("150s").Duration()
 )
 
 func main() {
@@ -72,9 +73,15 @@ func main() {
 		os.Setenv("OS_CLIENT_CONFIG_FILE", *osClientConfig)
 	}
 
-	if *cacheEnable && *cacheTTL <= 0 {
-		level.Error(logger).Log("err", "--cache-ttl must be greater than 0")
-		os.Exit(-1)
+	if *cacheEnable {
+		if *cacheTTL <= 0 || *cacheInterval <= 0 {
+			level.Error(logger).Log("err", "--cache-ttl and --cache-interval must be greater than 0")
+			os.Exit(-1)
+		}
+		if *cacheInterval >= *cacheTTL {
+			level.Error(logger).Log("err", "--cache-interval must be less than --cache-ttl, otherwise the cache expires between collections", "cache_interval", *cacheInterval, "cache_ttl", *cacheTTL)
+			os.Exit(-1)
+		}
 	}
 
 	links := []web.LandingLinks{}
@@ -217,7 +224,7 @@ func metricHandler(services map[string]*bool, logger log.Logger) http.HandlerFun
 	if *cacheEnable {
 		// A single background loop runs the sweep; every scrape is served
 		// from its last result instead of triggering its own sweep.
-		cached := cache.New(prometheus.GathererFunc(sweep), *cacheTTL, logger)
+		cached := cache.New(prometheus.GathererFunc(sweep), *cacheTTL, *cacheInterval, logger)
 		go cached.Run(make(chan struct{}))
 		return promhttp.HandlerFor(cached, promhttp.HandlerOpts{}).ServeHTTP
 	}
