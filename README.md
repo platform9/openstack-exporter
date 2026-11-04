@@ -108,6 +108,8 @@ Flags:
                                  Disable UUID generation for Cinder agents
       --[no-]multi-cloud         Toggle the multiple cloud scraping mode under /probe?cloud=
       --domain-id=DOMAIN-ID      Gather metrics only for the given Domain ID (defaults to all domains)
+      --[no-]cache                Collect metrics in the background and serve every scrape from the last collection (legacy mode only)
+      --cache-ttl=300s           TTL for cached metrics (eg. 10s, 11m, 1h). Collection runs every cache-ttl/2; cached metrics older than cache-ttl are not served
       --[no-]disable-service.network  
                                  Disable the network service exporter
       --[no-]disable-service.compute  
@@ -173,6 +175,26 @@ curl "https://localhost:9180/probe?cloud=test.cloud&include_services=network,com
 ## Scrape all services except `load-balancer` and `dns` from `test.cloud`
 curl "https://localhost:9180/probe?cloud=test.cloud&exclude_services=load-balancer,dns"
 ```
+
+### Cache mechanism
+
+`--cache` applies only to legacy mode (`/metrics`, single cloud). It has no
+effect in multi-cloud mode (`/probe?cloud=`), since each probe already
+targets a specific cloud and is not swept in the background.
+
+Without `--cache`, every scrape of `/metrics` runs a full sweep of the OpenStack
+APIs, so two scrapers cause two sweeps. With `--cache`:
+
+* A background loop sweeps once at start-up and then every `cache-ttl/2`.
+  Sweeps never overlap; a sweep slower than `cache-ttl/2` is followed
+  immediately by the next one.
+* The stored result is replaced only when a sweep completes, and every scrape
+  is served from it without contacting OpenStack.
+* If the stored result is older than `cache-ttl`, scrapes return no OpenStack
+  metrics until the next sweep completes. Set `cache-ttl` comfortably above
+  the slowest sweep time.
+* Until the first sweep completes after start-up, scrapes return no OpenStack
+  metrics.
 
 ### OpenStack configuration
 

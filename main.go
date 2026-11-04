@@ -10,9 +10,11 @@ import (
 	kingpin "github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/openstack-exporter/openstack-exporter/cache"
 	"github.com/openstack-exporter/openstack-exporter/exporters"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
@@ -37,6 +39,8 @@ var (
 	cloud                    = kingpin.Arg("cloud", "name or id of the cloud to gather metrics from").String()
 	multiCloud               = kingpin.Flag("multi-cloud", "Toggle the multiple cloud scraping mode under /probe?cloud=").Default("false").Bool()
 	domainID                 = kingpin.Flag("domain-id", "Gather metrics only for the given Domain ID (defaults to all domains)").String()
+	cacheEnable              = kingpin.Flag("cache", "Collect metrics in the background and serve every scrape from the last collection (legacy mode only)").Default("false").Bool()
+	cacheTTL                 = kingpin.Flag("cache-ttl", "TTL for cached metrics (eg. 10s, 11m, 1h). Collection runs every cache-ttl/2; cached metrics older than cache-ttl are not served").Default("300s").Duration()
 )
 
 func main() {
@@ -66,6 +70,11 @@ func main() {
 	if *osClientConfig != DEFAULT_OS_CLIENT_CONFIG {
 		level.Debug(logger).Log("msg", "Setting Env var OS_CLIENT_CONFIG_FILE", "os_client_config_file", *osClientConfig)
 		os.Setenv("OS_CLIENT_CONFIG_FILE", *osClientConfig)
+	}
+
+	if *cacheEnable && *cacheTTL <= 0 {
+		level.Error(logger).Log("err", "--cache-ttl must be greater than 0")
+		os.Exit(-1)
 	}
 
 	links := []web.LandingLinks{}
@@ -164,8 +173,12 @@ func probeHandler(services map[string]*bool, logger log.Logger) http.HandlerFunc
 	}
 }
 
-func metricHandler(services map[string]*bool, logger log.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+// sweepFunc returns a function that runs one full sweep of the enabled
+// services' OpenStack APIs and returns the resulting metric families. Both
+// the uncached, per-request path and the --cache background loop drive the
+// sweep through this same function.
+func sweepFunc(services map[string]*bool, logger log.Logger) func() ([]*dto.MetricFamily, error) {
+	return func() ([]*dto.MetricFamily, error) {
 		level.Info(logger).Log("msg", "Starting openstack exporter version for cloud", "version", version.Info(), "cloud", *cloud)
 		level.Info(logger).Log("msg", "Build context", "build_context", version.BuildContext())
 
@@ -191,11 +204,32 @@ func metricHandler(services map[string]*bool, logger log.Logger) http.HandlerFun
 		}
 
 		if enabledExporters == 0 {
-			level.Error(logger).Log("err", "No exporter has been enabled, exiting")
-			os.Exit(-1)
+			return nil, fmt.Errorf("no exporter has been enabled")
 		}
 
-		h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-		h.ServeHTTP(w, r)
+		return registry.Gather()
+	}
+}
+
+func metricHandler(services map[string]*bool, logger log.Logger) http.HandlerFunc {
+	sweep := sweepFunc(services, logger)
+
+	if *cacheEnable {
+		// A single background loop runs the sweep; every scrape is served
+		// from its last result instead of triggering its own sweep.
+		cached := cache.New(prometheus.GathererFunc(sweep), *cacheTTL, logger)
+		go cached.Run(make(chan struct{}))
+		return promhttp.HandlerFor(cached, promhttp.HandlerOpts{}).ServeHTTP
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		families, err := sweep()
+		if err != nil {
+			level.Error(logger).Log("err", err)
+			os.Exit(-1)
+		}
+		promhttp.HandlerFor(prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) {
+			return families, nil
+		}), promhttp.HandlerOpts{}).ServeHTTP(w, r)
 	}
 }
