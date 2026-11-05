@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sync"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -35,7 +36,17 @@ func (suite *BaseOpenStackTestSuite) SetResponseFromFixture(method string, statu
 	}
 
 	responder := httpmock.ResponderFromResponse(response).Times(2)
-	httpmock.RegisterResponder(method, url, responder)
+
+	// httpmock's Times() call counter is a plain, unsynchronized closure
+	// variable (still true as of httpmock v1.4.2), so two metrics now
+	// collected concurrently (Collect runs them in parallel) can race on it
+	// if they hit the same mocked URL. Serialize calls into it ourselves.
+	var mu sync.Mutex
+	httpmock.RegisterResponder(method, url, func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return responder(req)
+	})
 }
 
 func (suite *BaseOpenStackTestSuite) MakeURL(resource string, port string) string {
