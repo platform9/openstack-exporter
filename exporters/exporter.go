@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -12,6 +13,7 @@ import (
 	"github.com/gophercloud/utils/openstack/clientconfig"
 	"github.com/hashicorp/go-uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 )
 
 type Metric struct {
@@ -111,9 +113,20 @@ func (exporter *BaseOpenStackExporter) RunCollection(metric *PrometheusMetric, m
 	return nil
 }
 
+// Collect runs every metric's Fn concurrently instead of one after another,
+// so one exporter's wall-clock cost is the slowest single metric rather than
+// their sum. Metrics only read exporter state (the OpenStack client,
+// Metrics map, config) and write to ch, both safe for concurrent use, so
+// this changes how long collection takes, not what it collects.
+//
+// Ported from upstream's errgroup-based Collect (v2.0.0-alpha,
+// exporters/exporter.go) onto this fork's logging and collection path,
+// without the rest of that alpha's changes.
 func (exporter *BaseOpenStackExporter) Collect(ch chan<- prometheus.Metric) {
-	metricsDown := 0
+	var metricsDown int32
 	metricsCount := len(exporter.Metrics)
+
+	var g errgroup.Group
 
 	for name, metric := range exporter.Metrics {
 		if metric.Fn == nil {
@@ -122,14 +135,21 @@ func (exporter *BaseOpenStackExporter) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 
-		if err := exporter.RunCollection(metric, name, ch, exporter.logger); err != nil {
-			level.Error(exporter.logger).Log("err", "Failed to collect metric for exporter", "exporter", exporter.Name, "error", err)
-			metricsDown++
-		}
+		name := name
+		metric := metric
+		g.Go(func() error {
+			if err := exporter.RunCollection(metric, name, ch, exporter.logger); err != nil {
+				level.Error(exporter.logger).Log("err", "Failed to collect metric for exporter", "exporter", exporter.Name, "error", err)
+				atomic.AddInt32(&metricsDown, 1)
+			}
+			return nil
+		})
 	}
 
+	_ = g.Wait()
+
 	//If all metrics collections fails for a given service, we'll flag it as down.
-	if metricsDown >= metricsCount {
+	if int(atomic.LoadInt32(&metricsDown)) >= metricsCount {
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["up"].Metric, prometheus.GaugeValue, 0)
 	} else {
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["up"].Metric, prometheus.GaugeValue, 1)
