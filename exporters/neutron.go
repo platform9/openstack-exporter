@@ -1,6 +1,7 @@
 package exporters
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"net/netip"
 
 	"github.com/go-kit/log"
+	"github.com/gophercloud/gophercloud"
+	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/agents"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/external"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/layer3/floatingips"
@@ -64,7 +67,7 @@ var defaultNeutronMetrics = []Metric{
 	{Name: "routers", Fn: ListRouters},
 	{Name: "routers_not_active"},
 	{Name: "l3_agent_of_router", Labels: []string{"router_id", "l3_agent_id", "ha_state", "agent_alive", "agent_admin_up", "agent_host"}},
-	{Name: "agent_state", Labels: []string{"id", "hostname", "service", "adminState", "availability_zone"}, Fn: ListAgentStates},
+	{Name: "agent_state", Labels: []string{"id", "hostname", "service", "adminState", "availability_zone", "pcd_cluster"}, Fn: ListAgentStates},
 	{Name: "network_ip_availabilities_total", Labels: []string{"network_id", "network_name", "ip_version", "cidr", "subnet_name", "project_id"}, Fn: ListNetworkIPAvailabilities},
 	{Name: "network_ip_availabilities_used", Labels: []string{"network_id", "network_name", "ip_version", "cidr", "subnet_name", "project_id"}},
 	{Name: "subnets_total", Labels: []string{"ip_version", "prefix", "prefix_length", "project_id", "subnet_pool_id", "subnet_pool_name"}, Fn: ListSubnetsPerPool},
@@ -141,6 +144,25 @@ func ListAgentStates(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 		return err
 	}
 
+	// Cluster membership is Nova host-aggregate data, so build a short-lived Nova
+	// compute client off this exporter's own credentials to look it up.
+	var eo gophercloud.EndpointOpts
+	if v, ok := endpointOpts["compute"]; ok {
+		eo = v
+	} else {
+		return errors.New("No EndpointOpts available to create Compute client")
+	}
+
+	computeClient, err := openstack.NewComputeV2(exporter.Client.ProviderClient, eo)
+	if err != nil {
+		return err
+	}
+
+	hostToClusterMap, err := buildHostToClusterMap(computeClient)
+	if err != nil {
+		return err
+	}
+
 	for _, agent := range allAgents {
 		var state int = 0
 		var id string
@@ -165,7 +187,7 @@ func ListAgentStates(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 		zone = agent.AvailabilityZone
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["agent_state"].Metric,
-			prometheus.CounterValue, float64(state), id, agent.Host, agent.Binary, adminState, zone)
+			prometheus.CounterValue, float64(state), id, agent.Host, agent.Binary, adminState, zone, hostToClusterMap[agent.Host])
 	}
 
 	return nil
