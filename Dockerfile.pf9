@@ -27,7 +27,7 @@ RUN mkdir -p /out && \
 	GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=${CGO_ENABLED} \
 	go build -trimpath -ldflags="-s -w" -o /out/openstack-exporter .
 
-FROM quay.io/prometheus/busybox:latest
+FROM quay.io/prometheus/busybox:latest@sha256:7379672d53c28113469275f2eb48adffa19954f39f8ef20c1e2992278f658e6c
 
 ARG VERSION=1.0.0
 ARG BUILD_ID=0
