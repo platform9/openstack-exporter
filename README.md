@@ -108,6 +108,9 @@ Flags:
                                  Disable UUID generation for Cinder agents
       --[no-]multi-cloud         Toggle the multiple cloud scraping mode under /probe?cloud=
       --domain-id=DOMAIN-ID      Gather metrics only for the given Domain ID (defaults to all domains)
+      --[no-]cache                Collect metrics in the background and serve every scrape from the last collection (legacy mode only)
+      --cache-ttl=300s           TTL for cached metrics (eg. 10s, 11m, 1h). Cached metrics older than cache-ttl are not served
+      --cache-interval=150s      How often the background collection runs when --cache is enabled (eg. 30s, 5m). Must be less than --cache-ttl
       --[no-]disable-service.network  
                                  Disable the network service exporter
       --[no-]disable-service.compute  
@@ -173,6 +176,26 @@ curl "https://localhost:9180/probe?cloud=test.cloud&include_services=network,com
 ## Scrape all services except `load-balancer` and `dns` from `test.cloud`
 curl "https://localhost:9180/probe?cloud=test.cloud&exclude_services=load-balancer,dns"
 ```
+
+### Cache mechanism
+
+`--cache` applies only to legacy mode (`/metrics`, single cloud). It has no
+effect in multi-cloud mode (`/probe?cloud=`), since each probe already
+targets a specific cloud and is not swept in the background.
+
+Without `--cache`, every scrape of `/metrics` runs a full sweep of the OpenStack
+APIs, so two scrapers cause two sweeps. With `--cache`:
+
+* A background loop sweeps once at start-up and then every `cache-interval`.
+  Sweeps never overlap; a sweep slower than `cache-interval` is followed
+  immediately by the next one. `cache-interval` must be less than `cache-ttl`.
+* The stored result is replaced only when a sweep completes, and every scrape
+  is served from it without contacting OpenStack.
+* If the stored result is older than `cache-ttl`, scrapes return no OpenStack
+  metrics until the next sweep completes. Set `cache-ttl` comfortably above
+  `cache-interval` plus the slowest sweep time.
+* Until the first sweep completes after start-up, scrapes return no OpenStack
+  metrics.
 
 ### OpenStack configuration
 
