@@ -42,8 +42,8 @@ build:
 		--build-arg CGO_ENABLED=$(CGO_ENABLED) \
 		--build-arg VERSION=$(PF9_VERSION) \
 		--build-arg BUILD_ID=$(BUILD_NUMBER) \
-		--build-arg BRANCH=$(BRANCH) \
-		--build-arg APP_METADATA=$(APP_METADATA) \
+		--build-arg BRANCH='$(BRANCH)' \
+		--build-arg APP_METADATA='$(APP_METADATA)' \
 		-f $(DOCKERFILE) -t $(FULL_IMAGE) .
 	$(DOCKER) tag $(FULL_IMAGE) $(ECR_FULL_IMAGE)
 	echo $(IMAGE_TAG) > container-tag
