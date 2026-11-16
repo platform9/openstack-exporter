@@ -1,7 +1,6 @@
 package exporters
 
 import (
-	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -11,7 +10,7 @@ import (
 	"net/netip"
 
 	"github.com/go-kit/log"
-	"github.com/gophercloud/gophercloud"
+	"github.com/go-kit/log/level"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/agents"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/external"
@@ -130,6 +129,36 @@ func ListFloatingIps(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 	return nil
 }
 
+// neutronHostToClusterMap resolves hostname -> PCD cluster for neutron agents.
+//
+// Cluster membership is Nova host-aggregate data, so this reaches into Nova with
+// a short-lived compute client built from this exporter's own credentials. Every
+// failure degrades to an empty map rather than an error: losing the pcd_cluster
+// label is acceptable, losing agent_state is not, since hypervisor-down alerting
+// is built on it and with --cache a dropped metric stays missing for a whole
+// sweep interval.
+func neutronHostToClusterMap(exporter *BaseOpenStackExporter) map[string]string {
+	eo, ok := endpointOpts["compute"]
+	if !ok {
+		level.Warn(exporter.logger).Log("msg", "no compute EndpointOpts, pcd_cluster label will be empty")
+		return map[string]string{}
+	}
+
+	computeClient, err := openstack.NewComputeV2(exporter.Client.ProviderClient, eo)
+	if err != nil {
+		level.Warn(exporter.logger).Log("msg", "could not build compute client, pcd_cluster label will be empty", "err", err)
+		return map[string]string{}
+	}
+
+	hostToClusterMap, err := buildHostToClusterMap(computeClient)
+	if err != nil {
+		level.Warn(exporter.logger).Log("msg", "pcd_cluster lookup failed, emitting empty label", "err", err)
+		return map[string]string{}
+	}
+
+	return hostToClusterMap
+}
+
 // ListAgentStates : list agent state per node
 func ListAgentStates(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
 	var allAgents []agents.Agent
@@ -144,24 +173,7 @@ func ListAgentStates(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 		return err
 	}
 
-	// Cluster membership is Nova host-aggregate data, so build a short-lived Nova
-	// compute client off this exporter's own credentials to look it up.
-	var eo gophercloud.EndpointOpts
-	if v, ok := endpointOpts["compute"]; ok {
-		eo = v
-	} else {
-		return errors.New("No EndpointOpts available to create Compute client")
-	}
-
-	computeClient, err := openstack.NewComputeV2(exporter.Client.ProviderClient, eo)
-	if err != nil {
-		return err
-	}
-
-	hostToClusterMap, err := buildHostToClusterMap(computeClient)
-	if err != nil {
-		return err
-	}
+	hostToClusterMap := neutronHostToClusterMap(exporter)
 
 	for _, agent := range allAgents {
 		var state int = 0

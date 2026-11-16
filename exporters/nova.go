@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/compute/apiversions"
@@ -142,9 +143,13 @@ func ListNovaAgentState(exporter *BaseOpenStackExporter, ch chan<- prometheus.Me
 		return err
 	}
 
+	// A failed cluster lookup costs only the pcd_cluster label. agent_state has to
+	// keep being reported either way: hypervisor-down alerting is built on it, and
+	// with --cache a dropped metric stays missing for a whole sweep interval.
 	hostToClusterMap, err := buildHostToClusterMap(exporter.Client)
 	if err != nil {
-		return err
+		level.Warn(exporter.logger).Log("msg", "pcd_cluster lookup failed, emitting empty label", "err", err)
+		hostToClusterMap = map[string]string{}
 	}
 
 	for _, service := range allServices {

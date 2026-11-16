@@ -3,6 +3,7 @@ package exporters
 import (
 	"strings"
 
+	"github.com/jarcoal/httpmock"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -143,5 +144,28 @@ openstack_nova_vcpus_used{aggregates="",availability_zone="",hostname="host1",pc
 
 func (suite *NovaTestSuite) TestNovaExporter() {
 	err := testutil.CollectAndCompare(*suite.Exporter, strings.NewReader(novaExpectedUp))
+	assert.NoError(suite.T(), err)
+}
+
+// agent_state carries the pcd_cluster label, which comes from a separate
+// host-aggregate lookup. That lookup must never take the metric down with it:
+// hypervisor-down alerting is built on agent_state, and under --cache a metric
+// dropped from one sweep stays missing until the next one completes.
+var novaExpectedAgentStateWithoutAggregates = `
+# HELP openstack_nova_agent_state agent_state
+# TYPE openstack_nova_agent_state counter
+openstack_nova_agent_state{adminState="disabled",disabledReason="test1",hostname="host1",id="1",pcd_cluster="",service="nova-scheduler",zone="internal"} 1
+openstack_nova_agent_state{adminState="disabled",disabledReason="test2",hostname="host1",id="2",pcd_cluster="",service="nova-compute",zone="nova"} 1
+openstack_nova_agent_state{adminState="disabled",disabledReason="test4",hostname="host2",id="4",pcd_cluster="",service="nova-compute",zone="nova"} 0
+openstack_nova_agent_state{adminState="enabled",disabledReason="",hostname="host2",id="3",pcd_cluster="",service="nova-scheduler",zone="internal"} 0
+`
+
+func (suite *NovaTestSuite) TestNovaAgentStateSurvivesAggregatesFailure() {
+	httpmock.RegisterResponder("GET", suite.MakeURL("/compute/os-aggregates", ""),
+		httpmock.NewStringResponder(500, `{"itemNotFound": {"code": 500}}`))
+
+	err := testutil.CollectAndCompare(*suite.Exporter,
+		strings.NewReader(novaExpectedAgentStateWithoutAggregates),
+		"openstack_nova_agent_state")
 	assert.NoError(suite.T(), err)
 }
