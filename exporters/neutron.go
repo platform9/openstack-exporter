@@ -10,6 +10,8 @@ import (
 	"net/netip"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/agents"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/external"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/layer3/floatingips"
@@ -64,7 +66,7 @@ var defaultNeutronMetrics = []Metric{
 	{Name: "routers", Fn: ListRouters},
 	{Name: "routers_not_active"},
 	{Name: "l3_agent_of_router", Labels: []string{"router_id", "l3_agent_id", "ha_state", "agent_alive", "agent_admin_up", "agent_host"}},
-	{Name: "agent_state", Labels: []string{"id", "hostname", "service", "adminState", "availability_zone"}, Fn: ListAgentStates},
+	{Name: "agent_state", Labels: []string{"id", "hostname", "service", "adminState", "availability_zone", "pcd_cluster"}, Fn: ListAgentStates},
 	{Name: "network_ip_availabilities_total", Labels: []string{"network_id", "network_name", "ip_version", "cidr", "subnet_name", "project_id"}, Fn: ListNetworkIPAvailabilities},
 	{Name: "network_ip_availabilities_used", Labels: []string{"network_id", "network_name", "ip_version", "cidr", "subnet_name", "project_id"}},
 	{Name: "subnets_total", Labels: []string{"ip_version", "prefix", "prefix_length", "project_id", "subnet_pool_id", "subnet_pool_name"}, Fn: ListSubnetsPerPool},
@@ -127,6 +129,36 @@ func ListFloatingIps(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 	return nil
 }
 
+// neutronHostToClusterMap resolves hostname -> PCD cluster for neutron agents.
+//
+// Cluster membership is Nova host-aggregate data, so this reaches into Nova with
+// a short-lived compute client built from this exporter's own credentials. Every
+// failure degrades to an empty map rather than an error: losing the pcd_cluster
+// label is acceptable, losing agent_state is not, since hypervisor-down alerting
+// is built on it and with --cache a dropped metric stays missing for a whole
+// sweep interval.
+func neutronHostToClusterMap(exporter *BaseOpenStackExporter) map[string]string {
+	eo, ok := endpointOpts["compute"]
+	if !ok {
+		level.Warn(exporter.logger).Log("msg", "no compute EndpointOpts, pcd_cluster label will be empty")
+		return map[string]string{}
+	}
+
+	computeClient, err := openstack.NewComputeV2(exporter.Client.ProviderClient, eo)
+	if err != nil {
+		level.Warn(exporter.logger).Log("msg", "could not build compute client, pcd_cluster label will be empty", "err", err)
+		return map[string]string{}
+	}
+
+	hostToClusterMap, err := buildHostToClusterMap(computeClient)
+	if err != nil {
+		level.Warn(exporter.logger).Log("msg", "pcd_cluster lookup failed, emitting empty label", "err", err)
+		return map[string]string{}
+	}
+
+	return hostToClusterMap
+}
+
 // ListAgentStates : list agent state per node
 func ListAgentStates(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
 	var allAgents []agents.Agent
@@ -140,6 +172,8 @@ func ListAgentStates(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 	if err != nil {
 		return err
 	}
+
+	hostToClusterMap := neutronHostToClusterMap(exporter)
 
 	for _, agent := range allAgents {
 		var state int = 0
@@ -165,7 +199,7 @@ func ListAgentStates(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 		zone = agent.AvailabilityZone
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["agent_state"].Metric,
-			prometheus.CounterValue, float64(state), id, agent.Host, agent.Binary, adminState, zone)
+			prometheus.CounterValue, float64(state), id, agent.Host, agent.Binary, adminState, zone, hostToClusterMap[agent.Host])
 	}
 
 	return nil

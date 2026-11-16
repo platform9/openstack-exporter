@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/compute/apiversions"
@@ -23,6 +24,7 @@ import (
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/openstack/identity/v3/projects"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/singleflight"
 )
 
 var server_status = []string{
@@ -78,16 +80,16 @@ var defaultNovaMetrics = []Metric{
 	{Name: "availability_zones", Fn: ListAZs},
 	{Name: "security_groups", Fn: ListComputeSecGroups},
 	{Name: "total_vms", Fn: ListAllServers},
-	{Name: "agent_state", Labels: []string{"id", "hostname", "service", "adminState", "zone", "disabledReason"}, Fn: ListNovaAgentState},
-	{Name: "running_vms", Labels: []string{"hostname", "availability_zone", "aggregates"}, Fn: ListHypervisors},
-	{Name: "current_workload", Labels: []string{"hostname", "availability_zone", "aggregates"}},
-	{Name: "vcpus_available", Labels: []string{"hostname", "availability_zone", "aggregates"}},
-	{Name: "vcpus_used", Labels: []string{"hostname", "availability_zone", "aggregates"}},
-	{Name: "memory_available_bytes", Labels: []string{"hostname", "availability_zone", "aggregates"}},
-	{Name: "memory_used_bytes", Labels: []string{"hostname", "availability_zone", "aggregates"}},
-	{Name: "local_storage_available_bytes", Labels: []string{"hostname", "availability_zone", "aggregates"}},
-	{Name: "local_storage_used_bytes", Labels: []string{"hostname", "availability_zone", "aggregates"}},
-	{Name: "free_disk_bytes", Labels: []string{"hostname", "availability_zone", "aggregates"}},
+	{Name: "agent_state", Labels: []string{"id", "hostname", "service", "adminState", "zone", "disabledReason", "pcd_cluster"}, Fn: ListNovaAgentState},
+	{Name: "running_vms", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}, Fn: ListHypervisors},
+	{Name: "current_workload", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
+	{Name: "vcpus_available", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
+	{Name: "vcpus_used", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
+	{Name: "memory_available_bytes", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
+	{Name: "memory_used_bytes", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
+	{Name: "local_storage_available_bytes", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
+	{Name: "local_storage_used_bytes", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
+	{Name: "free_disk_bytes", Labels: []string{"hostname", "availability_zone", "aggregates", "pcd_cluster"}},
 	{Name: "server_status", Labels: []string{"id", "status", "name", "tenant_id", "user_id", "address_ipv4",
 		"address_ipv6", "host_id", "hypervisor_hostname", "uuid", "availability_zone", "flavor_id", "instance_libvirt"}},
 	{Name: "limits_vcpus_max", Labels: []string{"tenant", "tenant_id"}, Fn: ListComputeLimits, Slow: true},
@@ -142,13 +144,22 @@ func ListNovaAgentState(exporter *BaseOpenStackExporter, ch chan<- prometheus.Me
 		return err
 	}
 
+	// A failed cluster lookup costs only the pcd_cluster label. agent_state has to
+	// keep being reported either way: hypervisor-down alerting is built on it, and
+	// with --cache a dropped metric stays missing for a whole sweep interval.
+	hostToClusterMap, err := buildHostToClusterMap(exporter.Client)
+	if err != nil {
+		level.Warn(exporter.logger).Log("msg", "pcd_cluster lookup failed, emitting empty label", "err", err)
+		hostToClusterMap = map[string]string{}
+	}
+
 	for _, service := range allServices {
 		var state = 0
 		if service.State == "up" {
 			state = 1
 		}
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["agent_state"].Metric,
-			prometheus.CounterValue, float64(state), service.ID, service.Host, service.Binary, service.Status, service.Zone, service.DisabledReason)
+			prometheus.CounterValue, float64(state), service.ID, service.Host, service.Binary, service.Status, service.Zone, service.DisabledReason, hostToClusterMap[service.Host])
 	}
 
 	return nil
@@ -167,17 +178,13 @@ func ListHypervisors(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 		return err
 	}
 
-	allPagesAggregates, err := aggregates.List(exporter.Client).AllPages()
-	if err != nil {
+	if allAggregates, err = listAggregates(exporter.Client); err != nil {
 		return err
 	}
 
-	if allAggregates, err = aggregates.ExtractAggregates(allPagesAggregates); err != nil {
-		return err
-	}
-
-	hostToAzMap := map[string]string{}     // map of hypervisors and in which AZ they are
-	hostToAggrMap := map[string][]string{} // map of hypervisors and of which aggregates they are part of
+	hostToAzMap := map[string]string{}      // map of hypervisors and in which AZ they are
+	hostToAggrMap := map[string][]string{}  // map of hypervisors and of which aggregates they are part of
+	hostToClusterMap := map[string]string{} // map of hypervisors to the PCD cluster (pf9-managed aggregate) they're in
 	for _, a := range allAggregates {
 		isAzAggregate := isAzAggregate(a)
 		for _, h := range a.Hosts {
@@ -190,6 +197,11 @@ func ListHypervisors(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 				hostToAggrMap[h] = append(hostToAggrMap[h], a.Name)
 			}
 		}
+		if isPf9ManagedAggregate(a) {
+			for _, h := range a.Hosts {
+				hostToClusterMap[h] = a.Name
+			}
+		}
 	}
 
 	for _, hypervisor := range allHypervisors {
@@ -197,32 +209,33 @@ func ListHypervisors(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 		if val, ok := hostToAzMap[hypervisor.Service.Host]; ok {
 			availabilityZone = val
 		}
+		pcdCluster := hostToClusterMap[hypervisor.Service.Host]
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["running_vms"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.RunningVMs), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.RunningVMs), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["current_workload"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.CurrentWorkload), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.CurrentWorkload), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["vcpus_available"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.VCPUs), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.VCPUs), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["vcpus_used"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.VCPUsUsed), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.VCPUsUsed), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["memory_available_bytes"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.MemoryMB*MEGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.MemoryMB*MEGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["memory_used_bytes"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.MemoryMBUsed*MEGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.MemoryMBUsed*MEGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["local_storage_available_bytes"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.LocalGB*GIGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.LocalGB*GIGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["local_storage_used_bytes"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.LocalGBUsed*GIGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.LocalGBUsed*GIGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 		ch <- prometheus.MustNewConstMetric(exporter.Metrics["free_disk_bytes"].Metric,
-			prometheus.GaugeValue, float64(hypervisor.FreeDiskGB*GIGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap))
+			prometheus.GaugeValue, float64(hypervisor.FreeDiskGB*GIGABYTE), hypervisor.HypervisorHostname, availabilityZone, aggregatesLabel(hypervisor.Service.Host, hostToAggrMap), pcdCluster)
 
 	}
 
@@ -436,6 +449,73 @@ func isAzAggregate(a aggregates.Aggregate) bool {
 		}
 	}
 	return false
+}
+
+// pf9ManagedAggregateMetadataKey is the aggregate metadata key resmgr sets when it
+// provisions a PCD cluster's Nova host aggregate. It's what distinguishes a "this
+// aggregate IS a PCD cluster" aggregate from other aggregate uses (AZ-only, failure
+// domain, GPU grouping, etc).
+const pf9ManagedAggregateMetadataKey = "pf9-managed"
+
+func isPf9ManagedAggregate(a aggregates.Aggregate) bool {
+	return a.Metadata[pf9ManagedAggregateMetadataKey] == "true"
+}
+
+// buildHostToClusterMap returns hostname -> PCD cluster name, derived from Nova host
+// aggregates tagged pf9-managed. A host belongs to at most one such aggregate, so unlike
+// aggregatesLabel this is a single value, not a comma-joined list.
+// aggregatesGroup collapses overlapping host-aggregate lookups into one request.
+//
+// Three collectors want the same list on every sweep: nova's ListHypervisors
+// (for the availability_zone and aggregates labels) and both agent_state
+// collectors (for pcd_cluster). Collect runs a metric's Fn concurrently and the
+// registry gathers exporters concurrently too, so those requests overlap.
+// singleflight lets the first one do the work and hands its result to whoever
+// asked while it was in flight.
+//
+// Unlike a TTL cache this can never serve a stale list: callers that don't
+// overlap each get their own fetch. The saving is therefore opportunistic, not
+// guaranteed, which is the right trade for data that drives alerting.
+var aggregatesGroup singleflight.Group
+
+// listAggregates returns every Nova host aggregate, sharing one in-flight
+// request between concurrent callers.
+//
+// The result is shared, so callers must treat it as read-only. Keyed on the
+// compute endpoint so separate clouds (--multi-cloud) never share a result and
+// nothing accumulates per client instance.
+func listAggregates(client *gophercloud.ServiceClient) ([]aggregates.Aggregate, error) {
+	v, err, _ := aggregatesGroup.Do(client.Endpoint, func() (interface{}, error) {
+		allPagesAggregates, err := aggregates.List(client).AllPages()
+		if err != nil {
+			return nil, err
+		}
+		return aggregates.ExtractAggregates(allPagesAggregates)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return v.([]aggregates.Aggregate), nil
+}
+
+func buildHostToClusterMap(client *gophercloud.ServiceClient) (map[string]string, error) {
+	allAggregates, err := listAggregates(client)
+	if err != nil {
+		return nil, err
+	}
+
+	hostToClusterMap := map[string]string{}
+	for _, a := range allAggregates {
+		if !isPf9ManagedAggregate(a) {
+			continue
+		}
+		for _, h := range a.Hosts {
+			hostToClusterMap[h] = a.Name
+		}
+	}
+
+	return hostToClusterMap, nil
 }
 
 func aggregatesLabel(h string, hostToAggrMap map[string][]string) string {
