@@ -24,6 +24,7 @@ import (
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/openstack/identity/v3/projects"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/singleflight"
 )
 
 var server_status = []string{
@@ -177,12 +178,7 @@ func ListHypervisors(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metri
 		return err
 	}
 
-	allPagesAggregates, err := aggregates.List(exporter.Client).AllPages()
-	if err != nil {
-		return err
-	}
-
-	if allAggregates, err = aggregates.ExtractAggregates(allPagesAggregates); err != nil {
+	if allAggregates, err = listAggregates(exporter.Client); err != nil {
 		return err
 	}
 
@@ -468,13 +464,43 @@ func isPf9ManagedAggregate(a aggregates.Aggregate) bool {
 // buildHostToClusterMap returns hostname -> PCD cluster name, derived from Nova host
 // aggregates tagged pf9-managed. A host belongs to at most one such aggregate, so unlike
 // aggregatesLabel this is a single value, not a comma-joined list.
-func buildHostToClusterMap(client *gophercloud.ServiceClient) (map[string]string, error) {
-	allPagesAggregates, err := aggregates.List(client).AllPages()
+// aggregatesGroup collapses overlapping host-aggregate lookups into one request.
+//
+// Three collectors want the same list on every sweep: nova's ListHypervisors
+// (for the availability_zone and aggregates labels) and both agent_state
+// collectors (for pcd_cluster). Collect runs a metric's Fn concurrently and the
+// registry gathers exporters concurrently too, so those requests overlap.
+// singleflight lets the first one do the work and hands its result to whoever
+// asked while it was in flight.
+//
+// Unlike a TTL cache this can never serve a stale list: callers that don't
+// overlap each get their own fetch. The saving is therefore opportunistic, not
+// guaranteed, which is the right trade for data that drives alerting.
+var aggregatesGroup singleflight.Group
+
+// listAggregates returns every Nova host aggregate, sharing one in-flight
+// request between concurrent callers.
+//
+// The result is shared, so callers must treat it as read-only. Keyed on the
+// compute endpoint so separate clouds (--multi-cloud) never share a result and
+// nothing accumulates per client instance.
+func listAggregates(client *gophercloud.ServiceClient) ([]aggregates.Aggregate, error) {
+	v, err, _ := aggregatesGroup.Do(client.Endpoint, func() (interface{}, error) {
+		allPagesAggregates, err := aggregates.List(client).AllPages()
+		if err != nil {
+			return nil, err
+		}
+		return aggregates.ExtractAggregates(allPagesAggregates)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	allAggregates, err := aggregates.ExtractAggregates(allPagesAggregates)
+	return v.([]aggregates.Aggregate), nil
+}
+
+func buildHostToClusterMap(client *gophercloud.ServiceClient) (map[string]string, error) {
+	allAggregates, err := listAggregates(client)
 	if err != nil {
 		return nil, err
 	}
